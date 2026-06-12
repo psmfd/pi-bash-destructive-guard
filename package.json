@@ -1,0 +1,25 @@
+{
+	"name": "@psmfd/pi-bash-destructive-guard",
+	"version": "0.1.0",
+	"description": "Pi extension: blast-radius guard denying destructive bash (rm/mv) outside a configurable safe-path list",
+	"type": "module",
+	"license": "MIT",
+	"repository": "github:psmfd/pi-bash-destructive-guard",
+	"keywords": ["pi", "pi-extension"],
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "tsx --test test/*.test.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.75"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "0.79.2",
+		"@types/node": "^22.10.5",
+		"tsx": "^4.19.2",
+		"typescript": "^5.6.3"
+	}
+}
