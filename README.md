@@ -1,25 +1,6 @@
-# pi-bash-destructive-guard
+# bash-destructive-guard
 
-> **Distribution mirror.** Developed in a private source-of-truth repo and synced here for distribution
-> (current sync: `pi_config@96565a0`, 2026-06-12). The `main` branch is force-synced — please don't
-> target PRs at it directly; file an [issue](https://github.com/psmfd/pi-bash-destructive-guard/issues)
-> instead and fixes will land via the next sync.
-
-Pi extension that denies `bash` tool calls invoking destructive verbs (`rm`, `mv`) against paths outside a configurable safe list. Companion to `pi-secrets-guard` — together they bracket the two highest-frequency catastrophic outcomes (data destruction and credential exfiltration).
-
-## Install
-
-```bash
-pi install git:github.com/psmfd/pi-bash-destructive-guard@v0.1.0
-```
-
-Or try it for a single session without installing:
-
-```bash
-pi -e git:github.com/psmfd/pi-bash-destructive-guard
-```
-
-No build step — pi loads the TypeScript directly. The pi SDK is bundled by pi itself; this extension has no runtime dependencies of its own.
+Pi extension that denies `bash` tool calls invoking destructive verbs (`rm`, `mv`) against paths outside a configurable safe list. Companion to `secrets-guard` — together they bracket the two highest-frequency catastrophic outcomes (data destruction and credential exfiltration).
 
 ## Hooked events
 
@@ -29,7 +10,7 @@ No build step — pi loads the TypeScript directly. The pi SDK is bundled by pi 
 
 This guard provides **blast-radius isolation** against the agent issuing a *naive or mistaken* destructive command (`rm /etc/foo`, `rm;rm /x`, `sudo rm`, `find . -exec rm`, a pasted one-liner). It is **not** a sandbox and **not** a defense against an adversary deliberately crafting shell to evade it — static analysis of shell is undecidable, so ANSI-C quoting (`$'\x72m'`), parameter-default expansion (`${x:-rm}`), variable indirection (`R=rm; $R /x`), and `eval`-of-substitution are accepted fail-open residual gaps (documented in `index.ts`). Anyone with shell and intent can also set `SKIP_DESTRUCTIVE_GUARD=1`.
 
-## Detection model
+## Detection model (#297)
 
 **Preprocess:** collapse `\<newline>` line continuations, strip heredoc bodies (their content is data, not commands), normalize `$IFS`/`${IFS}` to a space.
 
@@ -66,7 +47,7 @@ The `cwd` entry means the extension does not block destructive operations within
 
 ## Refusal policy (per-rule)
 
-The `damage-control-continue` pattern (from [`disler/pi-vs-claude-code`](https://github.com/disler/pi-vs-claude-code)) distinguishes **hard refusals** — where any retry is wrong and the agent should escalate to the user — from **continue-eligible** blocks, where the agent can recover by trying a modified approach. This extension classifies its rules accordingly; `reason:` payloads carry explicit guidance:
+The `damage-control-continue` pattern (from `disler/pi-vs-claude-code`, evaluated in [#69](https://github.com/TheSemicolon/pi_config/issues/69)) distinguishes **hard refusals** — where any retry is wrong and the agent should escalate to the user — from **continue-eligible** blocks, where the agent can recover by trying a modified approach. This extension classifies its rules accordingly; `reason:` payloads carry explicit guidance:
 
 | Rule | Policy | Rationale |
 |---|---|---|
@@ -76,9 +57,11 @@ The `damage-control-continue` pattern (from [`disler/pi-vs-claude-code`](https:/
 | `rm`/`mv` path with `..` traversal (rule 3b) | Continue-eligible | The agent can resolve to an absolute path or drop the `..` segments. |
 | `rm`/`mv` absolute path outside safe list (rule 3c) | Continue-eligible | The agent can switch to a cwd-relative path, edit `~/.config/pi/bash-guard-safe-paths.conf`, or operate under `/tmp`. |
 
+Neither the upstream `damage-control.ts` nor `damage-control-continue.ts` were vendored. The pattern adoption is pi-native: pi's `{block, reason}` return is already the no-abort path (this extension has never called `ctx.abort()`), so the actionable change is the per-rule policy classification and adaptive-feedback wording in `reason:` payloads.
+
 ## Override
 
-The override **announces itself via `ctx.ui.notify` on use** — silent overrides are not supported.
+The override **announces itself via `ctx.ui.notify`** on use — silent overrides are not supported (ADR-0022 § Q5, backported per issue #258).
 
 | Override | Scope |
 |---|---|
@@ -90,7 +73,7 @@ There is no per-call override. If you need to delete something outside the safe 
 
 ## Why not also block `dd`, `mkfs`, `chmod -R 777 /`?
 
-In practice, model-driven invocations of these are vanishingly rare and the false-positive cost is high (e.g. `chmod` on legitimate project files). `rm` and `mv` cover ~99% of the realized destructive-action risk. New verbs can be added to `DESTRUCTIVE_VERBS` if needed.
+The framework's earlier iteration extended this set; in practice, model-driven invocations of these are vanishingly rare and the false-positive cost is high (e.g. `chmod` on legitimate project files). `rm` and `mv` cover ~99% of the realized destructive-action risk. New verbs can be added to `DESTRUCTIVE_VERBS` if needed.
 
 ## Limitations
 
@@ -98,15 +81,3 @@ In practice, model-driven invocations of these are vanishingly rare and the fals
 - Quote-unaware *data* containing a destructive verb plus an absolute path inside a non-shell command is handled correctly (e.g. `echo "; rm /etc/x"` is allowed — the `;` is inside quotes), but a benign command whose **arguments** name `rm`/`mv` as a standalone word under an exec-wrapper (e.g. `sudo grep rm file`) is conservatively denied (fail-closed).
 - Out of scope entirely (different verbs, not `rm`/`mv`): `>` redirect-clobber, `find -delete`, `truncate`, `dd of=`, `python -c 'os.remove(...)'`.
 - The extension does not distinguish `rm -rf` from `rm` of a single file. The path-list check is what gates the action.
-
-## Development
-
-```bash
-npm install
-npm run typecheck
-npm test
-```
-
-## License
-
-[MIT](LICENSE)
