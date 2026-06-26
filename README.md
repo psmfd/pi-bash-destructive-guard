@@ -47,7 +47,7 @@ The `cwd` entry means the extension does not block destructive operations within
 
 ## Refusal policy (per-rule)
 
-The `damage-control-continue` pattern (from `disler/pi-vs-claude-code`, evaluated in [#69](https://github.com/TheSemicolon/pi_config/issues/69)) distinguishes **hard refusals** — where any retry is wrong and the agent should escalate to the user — from **continue-eligible** blocks, where the agent can recover by trying a modified approach. This extension classifies its rules accordingly; `reason:` payloads carry explicit guidance:
+The `damage-control-continue` pattern (from `disler/pi-vs-claude-code`, evaluated in #69) distinguishes **hard refusals** — where any retry is wrong and the agent should escalate to the user — from **continue-eligible** blocks, where the agent can recover by trying a modified approach. This extension classifies its rules accordingly; `reason:` payloads carry explicit guidance:
 
 | Rule | Policy | Rationale |
 |---|---|---|
