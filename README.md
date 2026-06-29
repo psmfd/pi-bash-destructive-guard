@@ -2,6 +2,14 @@
 
 Pi extension that denies `bash` tool calls invoking destructive verbs (`rm`, `mv`) against paths outside a configurable safe list. Companion to `secrets-guard` — together they bracket the two highest-frequency catastrophic outcomes (data destruction and credential exfiltration).
 
+## Install
+
+```sh
+pi install git:github.com/psmfd/pi-bash-destructive-guard
+```
+
+Try it first without installing: `pi -e git:github.com/psmfd/pi-bash-destructive-guard`.
+
 ## Hooked events
 
 - **`tool_call` for `bash`** — preprocesses, runs a quote-aware lexer, and applies layered per-segment checks.
