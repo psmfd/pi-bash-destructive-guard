@@ -1,21 +1,29 @@
 /**
  * bash-destructive-guard — pi extension
  *
- * Denies bash tool calls that invoke destructive verbs (`rm`, `mv`) against
- * paths outside a configurable safe list. Mirrors the framework's
- * hooks/bash-destructive-guard.sh but runs as a pi extension hooked on the
- * `tool_call` event for `bash`.
+ * Denies bash tool calls that invoke destructive operations against paths
+ * outside a configurable safe list. Runs as a pi extension hooked on the
+ * `tool_call` event for `bash`. The quote-aware lexing primitive lives in
+ * agent/extensions/shared/shell-lex.ts (ADR-0072) so sibling guards can reuse
+ * it; this file owns POLICY (which verbs/flags/paths are destructive).
  *
  * THREAT MODEL (read this before "fixing" a bypass):
  *   This guard provides BLAST-RADIUS ISOLATION against the agent issuing a
  *   *naive or mistaken* destructive command — `rm /etc/foo`, `rm;rm /x`,
- *   `sudo rm`, `eval 'rm ...'`, a pasted one-liner, etc. It is NOT a sandbox
- *   and NOT a defense against an adversary who is deliberately crafting
- *   shell to evade it: anyone with bash and intent can use ANSI-C quoting
- *   (`$'\x72m'`), parameter-default expansion (`${x:-rm}`), variable
- *   indirection (`R=rm; $R /x`), or simply set SKIP_DESTRUCTIVE_GUARD=1.
- *   Static analysis of shell is undecidable; we catch the realistic
- *   accidental cases and document the rest (see "Residual gaps" below).
+ *   `sudo rm`, `eval 'rm ...'`, `echo <b64> | base64 -d | sh`, a pasted
+ *   one-liner, etc. It is NOT a sandbox and NOT a defense against an adversary
+ *   who is deliberately crafting shell to evade it: anyone with bash and intent
+ *   can use ANSI-C quoting (`$'\x72m'`), parameter-default expansion
+ *   (`${x:-rm}`), variable indirection (`R=rm; $R /x`), a value-producing
+ *   substitution (`$(echo rm) -rf /`), a base64 payload only decoded at
+ *   runtime, or simply set SKIP_DESTRUCTIVE_GUARD=1. It also CANNOT see a
+ *   destructive verb that lives in a file a second interpreter reads — the
+ *   GuardFall Makefile-exfil class (`make test` runs a recipe containing
+ *   `rm -rf ~/.aws`): the string this guard receives is only `make test`.
+ *   Static analysis of shell is undecidable; we catch the realistic accidental
+ *   cases and document the rest. The sound boundary is below the shell
+ *   (execve/sandbox + $HOME scoping + egress control, issue #507). See
+ *   ADR-0072 and "Residual gaps" below.
  *
  * Safe paths:
  *   - Built-in: /tmp, the current pi cwd (and anything beneath it)
@@ -25,39 +33,36 @@
  * Override:
  *   - SKIP_DESTRUCTIVE_GUARD=1 in pi's env (extension loads but no hook)
  *
- * Detection model (#297):
- *   Preprocess: collapse `\<newline>` line continuations, strip heredoc
- *   bodies (their content is data, not commands), and normalize
- *   `$IFS`/`${IFS}` to a space. Then run a small QUOTE-AWARE lexer that
- *   splits into command-position segments on unquoted control operators and
- *   group/subshell/substitution boundaries (`;`, `|`, `&`, `(`, `)`,
- *   newline, backtick), tracks whether a segment reads from stdin/a file
- *   (`<`, `<<`, `<<<`), and strips surrounding quotes / escaping backslashes
- *   from each token. Leading `NAME=value` env assignments (including quoted
- *   multi-word values) are dropped so the real verb surfaces.
- *
- *   Per segment:
- *     1. Shell-interpreter verb (bash/sh/...) with `-c` OR reading a script
- *        from stdin/file (`<`/`<<`/`<<<`)   → DENY (bypass vector)
- *     2. Exec-wrapper verb (eval/xargs/sudo/...) whose token list contains
- *        `rm`/`mv` as a standalone token     → DENY (wrapped target is not
- *                                               statically validatable)
- *     3. Verb is rm or mv                     → check path tokens
- *        - metachar / `..` / outside-safe-and-absolute → DENY; else allow
- *     4. Anything else                        → allow
- *
- *   Because `$(...)`/backtick/subshell bodies become their own segments, a
- *   destructive verb inside them is path-validated directly (safe paths
- *   allowed, unsafe blocked) rather than waved through or blunt-blocked.
+ * Detection model (#297, extended by ADR-0072):
+ *   Preprocess (shared/shell-lex.ts): collapse `\<newline>` line continuations,
+ *   strip heredoc bodies, normalize `$IFS`/`${IFS}` to a space. Analysis runs
+ *   over TWO command variants — the preprocessed command and a "deglued"
+ *   variant with word-internal empty command substitutions removed
+ *   (`r$(true)m` → `rm`); a rule tripping in EITHER variant blocks. Each variant
+ *   is lexed into command-position segments; per segment:
+ *     0. Output redirection (`>`, `>|`) to an unsafe path  → DENY (clobber)
+ *     1. Shell-interpreter verb (bash/sh/...) with `-c`, reading a script from
+ *        stdin/file (`<`/`<<`/`<<<`), OR as a `|` pipeline sink → DENY (bypass)
+ *     2. Exec-wrapper verb (eval/xargs/sudo/find/...) whose token list contains
+ *        `rm`/`mv` as a standalone token                    → DENY
+ *     3. `rm`/`mv` targeting an unsafe path                 → DENY
+ *     4. `find ... -delete` rooted at an unsafe path        → DENY
+ *     5. `dd of=<device|unsafe path>`                       → DENY
+ *     6. `truncate -s <n> <unsafe path>`                    → DENY
+ *     7. Anything else                                      → allow
  *
  * Residual gaps (fail-open by design; adversarial, not accidental):
  *   - ANSI-C-quoted verbs/flags: `$'\x72m' /x`, `bash $'-c\nrm /x'`
  *   - parameter-default expansion: `${x:-rm} /x`
  *   - variable indirection: `R=rm; $R /x`
- *   - eval of a command substitution: `eval "$(printf rm) /x"`
- *   These require runtime expansion the guard does not perform. Out of scope
- *   entirely (different verbs): `>` clobber, `find -delete`, `truncate`,
- *   `dd of=`, `python -c 'os.remove(...)'`.
+ *   - value-producing / non-glued substitution: `$(echo rm) -rf /`,
+ *     `eval "$(printf rm) /x"` (the glued EMPTY case `r$(true)m` IS caught)
+ *   - base64/decode pipelines whose payload only exists after execution
+ *   - file-content indirection: `make test` where the Makefile recipe deletes
+ *   These require runtime expansion / execution the guard does not perform, or
+ *   a control below the shell. The structural fixes are tracked in #506 (AST
+ *   parser) and #507 (OS sandbox). Out of scope entirely (different verbs):
+ *   `>>` append, `python -c 'os.remove(...)'`.
  *
  * Source rule: this extension is the runtime counterpart to
  * agent/rules/secrets-guard.md's "blast-radius isolation" principle.
@@ -67,6 +72,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  lex,
+  preprocessCommand,
+  deglueWordSubstitutions,
+  stripEnvAssignments,
+  hasMinusC,
+  type Segment,
+  type Redirect,
+} from "./shared/shell-lex.ts";
 
 const SHELL_INTERPRETERS = new Set(["bash", "sh", "dash", "zsh", "ksh", "busybox"]);
 // Exec-wrappers that run another command and would otherwise hide a leading
@@ -98,16 +112,6 @@ const WRAPPER_VERBS = new Set([
 ]);
 const DESTRUCTIVE_VERBS = new Set(["rm", "mv"]);
 const META_CHAR_RE = /[$`|;&(){}]/;
-// Leading `NAME=value` environment-assignment prefix (e.g. `FOO=bar cmd ...`).
-const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
-// `$IFS` / `${IFS}` separator-obfuscation; normalized to a space.
-const IFS_RE = /\$\{IFS\}|\$IFS/g;
-
-interface Segment {
-  tokens: string[];
-  /** segment reads a script from stdin/a file (`<`, `<<`, `<<<`). */
-  readsInput: boolean;
-}
 
 function loadUserSafePaths(): string[] {
   const file = join(homedir(), ".config", "pi", "bash-guard-safe-paths.conf");
@@ -120,131 +124,6 @@ function loadUserSafePaths(): string[] {
   } catch {
     return [];
   }
-}
-
-// Remove heredoc bodies (their content is data, not executed commands). The
-// introducing line (e.g. `cat <<EOF`, `bash <<EOF`) is kept and still
-// analyzed — a shell interpreter reading a heredoc script is caught by the
-// stdin-redirect check, while a data heredoc (`cat`) is harmless.
-function stripHeredocs(command: string): string {
-  const lines = command.split("\n");
-  const out: string[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    out.push(line);
-    const m = line.match(/<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/);
-    if (!m) continue;
-    const delim = m[2];
-    const allowTab = line.includes("<<-");
-    while (i + 1 < lines.length) {
-      i++;
-      const body = allowTab ? lines[i].replace(/^\t+/, "") : lines[i];
-      if (body === delim) break;
-    }
-  }
-  return out.join("\n");
-}
-
-// Quote-aware lexer. Splits into command-position segments on unquoted
-// control operators / group boundaries, strips quotes and escaping
-// backslashes from tokens, and records stdin/file redirection. NOT a full
-// POSIX parser — see THREAT MODEL.
-function lex(command: string): Segment[] {
-  const segments: Segment[] = [];
-  let tokens: string[] = [];
-  let cur = "";
-  let curUsed = false; // distinguishes a real empty-quote token "" from no token
-  let readsInput = false;
-  let inSingle = false;
-  let inDouble = false;
-
-  const endToken = () => {
-    if (cur.length > 0 || curUsed) tokens.push(cur);
-    cur = "";
-    curUsed = false;
-  };
-  const endSegment = () => {
-    endToken();
-    if (tokens.length > 0 || readsInput) segments.push({ tokens, readsInput });
-    tokens = [];
-    readsInput = false;
-  };
-
-  for (let i = 0; i < command.length; i++) {
-    const c = command[i];
-
-    if (inSingle) {
-      if (c === "'") inSingle = false;
-      else {
-        cur += c;
-        curUsed = true;
-      }
-      continue;
-    }
-    if (inDouble) {
-      if (c === '"') {
-        inDouble = false;
-      } else if (c === "\\" && i + 1 < command.length && '"\\$`'.includes(command[i + 1])) {
-        cur += command[++i];
-        curUsed = true;
-      } else {
-        cur += c;
-        curUsed = true;
-      }
-      continue;
-    }
-
-    if (c === "'") {
-      inSingle = true;
-      curUsed = true;
-      continue;
-    }
-    if (c === '"') {
-      inDouble = true;
-      curUsed = true;
-      continue;
-    }
-    if (c === "\\") {
-      if (i + 1 < command.length) {
-        cur += command[++i];
-        curUsed = true;
-      }
-      continue;
-    }
-    if (c === ";" || c === "|" || c === "&" || c === "(" || c === ")" || c === "\n" || c === "`") {
-      endSegment();
-      continue;
-    }
-    if (c === "<") {
-      endToken();
-      readsInput = true;
-      continue;
-    }
-    if (c === ">") {
-      endToken();
-      continue;
-    }
-    if (c === " " || c === "\t" || c === "\r") {
-      endToken();
-      continue;
-    }
-    cur += c;
-    curUsed = true;
-  }
-  endSegment();
-  return segments;
-}
-
-// Drop leading `NAME=value` env-assignment tokens so the real verb surfaces.
-function stripEnvAssignments(tokens: string[]): string[] {
-  let i = 0;
-  while (i < tokens.length && ENV_ASSIGN_RE.test(tokens[i])) i++;
-  return tokens.slice(i);
-}
-
-function hasMinusC(tokens: string[]): boolean {
-  // `-c` or a single-dash short-option cluster containing `c` (`-ec`, `-xc`).
-  return tokens.some((t) => t === "-c" || /^-[A-Za-z]*c[A-Za-z]*$/.test(t));
 }
 
 // True if any wrapped token contains rm|mv as a standalone WORD. Word-level
@@ -268,54 +147,193 @@ function isUnderSafePath(target: string, safePaths: string[]): boolean {
   return false;
 }
 
-// Returns a block reason if a destructive verb targets an unsafe path, else null.
-function checkDestructivePaths(
-  verb: string,
-  tokens: string[],
+// Single-path safety verdict shared by every destructive operation. Returns a
+// block reason if `p` is unsafe (shell metachars, `..` traversal, or an
+// absolute path outside the safe list), else null. Relative paths are
+// implicitly within cwd and therefore safe.
+function pathUnsafeReason(
+  p: string,
   safePaths: string[],
+  label: string,
 ): string | null {
-  const pathTokens: string[] = [];
+  if (META_CHAR_RE.test(p)) {
+    return `bash-destructive-guard: ${label} path '${p}' contains shell metacharacters — refusing for safety.
+
+Suggested alternatives:
+  - Expand the glob or variable yourself and re-issue with an explicit literal path.
+  - Confirm the target list with \`ls <pattern>\` first, then act on each path individually.`;
+  }
+  if (p.includes("..")) {
+    return `bash-destructive-guard: ${label} path '${p}' contains '..' traversal — refusing for safety.
+
+Suggested alternatives:
+  - Resolve the path to its absolute form and re-issue with the absolute path.
+  - If the intent was relative to cwd, drop the \`..\` segments and use the direct relative path.`;
+  }
+  if (!p.startsWith("/")) return null; // relative → within cwd → safe
+  if (!isUnderSafePath(p, safePaths)) {
+    return `bash-destructive-guard: ${label} '${p}' — path outside safe list (${safePaths.join(", ")}).
+
+Suggested alternatives:
+  - If the operation belongs inside the project, use a path relative to cwd instead of an absolute path.
+  - If it is legitimately outside the project, add the parent directory to \`~/.config/pi/bash-guard-safe-paths.conf\` (one path per line) and retry.
+  - If you only need a scratch location, work under \`/tmp\` — already in the safe list.
+  - Last resort for a one-off destructive operation: set \`SKIP_DESTRUCTIVE_GUARD=1\` in the pi session env.`;
+  }
+  return null;
+}
+
+// Extract positional path arguments from `rm`/`mv` (skip flags, honor `--`).
+function destructivePathTokens(tokens: string[]): string[] {
+  const paths: string[] = [];
   let pastDashDash = false;
   for (const t of tokens.slice(1)) {
     if (t === "--") {
       pastDashDash = true;
       continue;
     }
-    if (pastDashDash || !t.startsWith("-")) pathTokens.push(t);
+    if (pastDashDash || !t.startsWith("-")) paths.push(t);
+  }
+  return paths;
+}
+
+// Leading path operands before the first `-flag` (used by `find`, whose paths
+// precede the expression: `find <path>... -delete`).
+function leadingPathArgs(tokens: string[]): string[] {
+  const paths: string[] = [];
+  for (const t of tokens.slice(1)) {
+    if (t.startsWith("-")) break;
+    paths.push(t);
+  }
+  return paths;
+}
+
+// Rule 3 — rm/mv path safety.
+function checkDestructivePaths(verb: string, tokens: string[], safePaths: string[]): string | null {
+  const paths = destructivePathTokens(tokens);
+  if (paths.length === 0) return null; // flags-only — harmless
+  for (const p of paths) {
+    const reason = pathUnsafeReason(p, safePaths, `'${verb}'`);
+    if (reason) return reason;
+  }
+  return null;
+}
+
+// Rule 0 — output-redirection clobber (`>`, `>|`) to an unsafe path.
+function checkClobber(redirects: Redirect[], safePaths: string[]): string | null {
+  for (const r of redirects) {
+    if (r.op !== ">" && r.op !== ">|") continue; // `>>` append is out of scope
+    if (!r.target) continue;
+    const reason = pathUnsafeReason(r.target, safePaths, "output-redirect (>)");
+    if (reason) return reason;
+  }
+  return null;
+}
+
+// Rule 4 — `find ... -delete` rooted at an unsafe path.
+function checkFindDelete(tokens: string[], safePaths: string[]): string | null {
+  if (!tokens.includes("-delete")) return null;
+  const roots = leadingPathArgs(tokens);
+  // No explicit root → find defaults to cwd, which is inside the safe list.
+  for (const p of roots) {
+    const reason = pathUnsafeReason(p, safePaths, "'find -delete' root");
+    if (reason) return reason;
+  }
+  return null;
+}
+
+// Rule 5 — `dd of=<device|unsafe path>`.
+function checkDd(tokens: string[], safePaths: string[]): string | null {
+  for (const t of tokens.slice(1)) {
+    if (!t.startsWith("of=")) continue;
+    const target = t.slice(3);
+    if (!target) continue;
+    if (target.startsWith("/dev/")) {
+      return `bash-destructive-guard: 'dd of=${target}' writes directly to a device — refusing for safety.
+
+Suggested alternatives:
+  - Write to a regular file under cwd or \`/tmp\` instead of a device node.
+  - If writing to a device is genuinely intended, run it in a separate terminal or set \`SKIP_DESTRUCTIVE_GUARD=1\` for a one-off.`;
+    }
+    const reason = pathUnsafeReason(target, safePaths, "'dd of='");
+    if (reason) return reason;
+  }
+  return null;
+}
+
+// Rule 6 — `truncate -s <n> <unsafe path>`. Skips the size flag/value, then
+// path-checks the remaining operands.
+function checkTruncate(tokens: string[], safePaths: string[]): string | null {
+  const paths: string[] = [];
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "-s" || t === "--size") {
+      i++; // consume the size value
+      continue;
+    }
+    if (t.startsWith("-")) continue; // -s0, --size=0, other flags
+    paths.push(t);
+  }
+  for (const p of paths) {
+    const reason = pathUnsafeReason(p, safePaths, "'truncate'");
+    if (reason) return reason;
+  }
+  return null;
+}
+
+// Per-segment policy. Returns a block reason or null.
+function analyzeSegment(seg: Segment, safePaths: string[]): string | null {
+  // Rule 0 — clobber can apply even with no command tokens (`> /etc/passwd`).
+  const clobber = checkClobber(seg.redirects, safePaths);
+  if (clobber) return clobber;
+
+  const tokens = stripEnvAssignments(seg.tokens);
+  if (tokens.length === 0) return null;
+  // Basename-normalize the verb so an absolute/relative path to the binary
+  // (`/bin/rm`, `/usr/bin/sudo`) classifies like its basename.
+  const rawVerb = tokens[0];
+  const verb = rawVerb.split("/").pop() || rawVerb;
+
+  // Rule 1 — shell interpreter with -c, a stdin/file script, or a pipe sink.
+  if (SHELL_INTERPRETERS.has(verb) && (seg.readsInput || seg.pipedInto || hasMinusC(tokens))) {
+    return `bash-destructive-guard: shell interpreter '${verb}' running a script from -c, stdin/file, or a pipeline sink is not permitted (bypass vector).
+
+This is a hard refusal — do not retry by re-wrapping the same payload. The bypass intent itself is what is blocked, not the wrapped command. If the wrapped command is legitimate, invoke it directly without the \`${verb}\` wrapper (no \`-c\`, no \`<<\`/\`<<<\`, no \`| ${verb}\`) so each verb can be evaluated on its own merits.`;
   }
 
-  if (pathTokens.length === 0) return null; // flags-only — harmless
-
-  for (const p of pathTokens) {
-    if (META_CHAR_RE.test(p)) {
-      return `bash-destructive-guard: '${verb}' path '${p}' contains shell metacharacters — refusing for safety.
+  // Rule 2 — exec-wrapper whose token list contains a destructive verb.
+  if (WRAPPER_VERBS.has(verb) && wrapsDestructive(tokens)) {
+    return `bash-destructive-guard: '${verb}' wraps a destructive verb (rm|mv) — refusing for safety (the wrapped target cannot be statically validated).
 
 Suggested alternatives:
-  - Expand the glob or variable yourself and issue \`${verb}\` with an explicit literal path.
-  - If you want to remove every file matching a pattern, use \`ls <pattern>\` first to confirm the list, then \`${verb}\` each path individually.`;
-    }
-    if (p.includes("..")) {
-      return `bash-destructive-guard: '${verb}' path '${p}' contains '..' traversal — refusing for safety.
-
-Suggested alternatives:
-  - Resolve the path to its absolute form and issue \`${verb}\` with the absolute path.
-  - If the intent was relative to cwd, drop the \`..\` segments and use the direct relative path.`;
-    }
-
-    // Relative paths (not starting with /) are implicitly within cwd
-    // and therefore inside the safe list.
-    if (!p.startsWith("/")) continue;
-
-    if (!isUnderSafePath(p, safePaths)) {
-      return `bash-destructive-guard: '${verb} ${p}' — path outside safe list (${safePaths.join(", ")}).
-
-Suggested alternatives:
-  - If the operation belongs inside the project, use a path relative to cwd instead of an absolute path.
-  - If the operation is legitimately outside the project, add the parent directory to \`~/.config/pi/bash-guard-safe-paths.conf\` (one path per line) and retry.
-  - If you only need a scratch location, work under \`/tmp\` — already in the safe list.
-  - Last resort for a one-off destructive operation: set \`SKIP_DESTRUCTIVE_GUARD=1\` in the pi session env.`;
-    }
+  - Invoke the destructive command directly (e.g. \`rm <path>\`) without the \`${verb}\` wrapper so the path can be evaluated against the safe list.
+  - If you must use \`${verb}\`, scope the operation under \`/tmp\` or cwd, or set \`SKIP_DESTRUCTIVE_GUARD=1\` for a one-off.`;
   }
+
+  // Rule 4 — find -delete (find is also a wrapper; rule 2 covers `-exec rm`).
+  if (verb === "find") {
+    const reason = checkFindDelete(tokens, safePaths);
+    if (reason) return reason;
+  }
+
+  // Rule 3 — rm/mv path check.
+  if (DESTRUCTIVE_VERBS.has(verb)) {
+    const reason = checkDestructivePaths(verb, tokens, safePaths);
+    if (reason) return reason;
+  }
+
+  // Rule 5 — dd of=
+  if (verb === "dd") {
+    const reason = checkDd(tokens, safePaths);
+    if (reason) return reason;
+  }
+
+  // Rule 6 — truncate -s
+  if (verb === "truncate") {
+    const reason = checkTruncate(tokens, safePaths);
+    if (reason) return reason;
+  }
+
   return null;
 }
 
@@ -347,40 +365,16 @@ export default function (pi: ExtensionAPI) {
     };
 
     const safePaths = ["/tmp", ctx.cwd, ...loadUserSafePaths()];
-    // Preprocess: collapse line continuations, strip heredoc bodies, normalize $IFS.
-    const command = stripHeredocs(raw.replace(/\\\n/g, "")).replace(IFS_RE, " ");
+    const command = preprocessCommand(raw);
+    // Analyze the command AND a deglued variant (word-internal empty command
+    // substitutions removed) so `r$(true)m` is caught. A rule tripping in
+    // either variant blocks; deduped when degluing is a no-op.
+    const deglued = deglueWordSubstitutions(command);
+    const variants = deglued === command ? [command] : [command, deglued];
 
-    for (const seg of lex(command)) {
-      const tokens = stripEnvAssignments(seg.tokens);
-      if (tokens.length === 0) continue;
-      // Basename-normalize the verb so an absolute/relative path to the
-      // binary (`/bin/rm`, `/usr/bin/sudo`) classifies like its basename.
-      const rawVerb = tokens[0];
-      const verb = rawVerb.split("/").pop() || rawVerb;
-
-      // 1. Shell interpreter with -c or a stdin/file script is a bypass vector.
-      if (SHELL_INTERPRETERS.has(verb) && (seg.readsInput || hasMinusC(tokens))) {
-        return block(
-          `bash-destructive-guard: shell interpreter '${verb}' running a script from -c or stdin/file is not permitted (bypass vector).
-
-This is a hard refusal — do not retry by re-wrapping the same payload. The bypass intent itself is what is blocked, not the wrapped command. If the wrapped command is legitimate, invoke it directly without the \`${verb}\` wrapper (no \`-c\`, no \`<<\`/\`<<<\`) so each verb can be evaluated on its own merits.`,
-        );
-      }
-
-      // 2. Exec-wrapper whose token list contains a destructive verb.
-      if (WRAPPER_VERBS.has(verb) && wrapsDestructive(tokens)) {
-        return block(
-          `bash-destructive-guard: '${verb}' wraps a destructive verb (rm|mv) — refusing for safety (the wrapped target cannot be statically validated).
-
-Suggested alternatives:
-  - Invoke the destructive command directly (e.g. \`rm <path>\`) without the \`${verb}\` wrapper so the path can be evaluated against the safe list.
-  - If you must use \`${verb}\`, scope the operation under \`/tmp\` or cwd, or set \`SKIP_DESTRUCTIVE_GUARD=1\` for a one-off.`,
-        );
-      }
-
-      // 3. Plain destructive-verb invocation — check path tokens.
-      if (DESTRUCTIVE_VERBS.has(verb)) {
-        const reason = checkDestructivePaths(verb, tokens, safePaths);
+    for (const variant of variants) {
+      for (const seg of lex(variant)) {
+        const reason = analyzeSegment(seg, safePaths);
         if (reason) return block(reason);
       }
     }
