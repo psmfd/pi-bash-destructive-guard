@@ -72,6 +72,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { canonicalize } from "./paths.ts";
+import { SHELL_INTERPRETERS, WRAPPER_VERBS } from "./policy-verbs.ts";
+import {
+  analyzeReportOnlySegment,
+  isReportOnlyProfileActive,
+  sanitizeGeneralDenyForProfile,
+} from "./report-only.ts";
 import {
   lex,
   preprocessCommand,
@@ -82,34 +89,9 @@ import {
   type Redirect,
 } from "./shared/shell-lex.ts";
 
-const SHELL_INTERPRETERS = new Set(["bash", "sh", "dash", "zsh", "ksh", "busybox"]);
-// Exec-wrappers that run another command and would otherwise hide a leading
-// destructive verb. We do not parse their argument grammar; if the segment's
-// token list contains rm|mv we fail closed.
-const WRAPPER_VERBS = new Set([
-  "eval",
-  "xargs",
-  "env",
-  "nohup",
-  "command",
-  "sudo",
-  "doas",
-  "su",
-  "runuser",
-  "timeout",
-  "time",
-  "nice",
-  "ionice",
-  "stdbuf",
-  "setsid",
-  "watch",
-  "flock",
-  "parallel",
-  "unshare",
-  "chroot",
-  "exec",
-  "find",
-]);
+// Verb classification sets shared with the report-only profile (ADR-0091)
+// live in policy-verbs.ts. The general guard's wrapper handling fails closed
+// when a wrapper's token list contains rm|mv as a standalone word.
 const DESTRUCTIVE_VERBS = new Set(["rm", "mv"]);
 const META_CHAR_RE = /[$`|;&(){}]/;
 
@@ -140,9 +122,10 @@ function wrapsDestructive(tokens: string[]): boolean {
 }
 
 function isUnderSafePath(target: string, safePaths: string[]): boolean {
+  const canon = canonicalize(target);
   for (const sp of safePaths) {
-    if (target === sp) return true;
-    if (target.startsWith(sp.endsWith("/") ? sp : sp + "/")) return true;
+    if (canon === sp) return true;
+    if (canon.startsWith(sp.endsWith("/") ? sp : sp + "/")) return true;
   }
   return false;
 }
@@ -338,19 +321,29 @@ Suggested alternatives:
 }
 
 export default function (pi: ExtensionAPI) {
-  if (process.env.SKIP_DESTRUCTIVE_GUARD === "1") {
-    // Session-wide bypass. Announce via notify per ADR-0022 § Q5
-    // "override cannot be silent" contract (backported from
-    // gh-identity-guard — issue #258). Extension loads but installs no
-    // tool_call handler.
+  const skipGeneral = process.env.SKIP_DESTRUCTIVE_GUARD === "1";
+  // The report-only profile (#551, ADR-0091) is read at load time: the env
+  // var is set by the PARENT (subagent spawn path) before this process
+  // starts, so an in-session `export PI_GUARD_PROFILE=` cannot un-certify
+  // the agent.
+  const profileActive = isReportOnlyProfileActive();
+
+  if (skipGeneral) {
+    // Session-wide bypass of the GENERAL rules. Announce via notify per
+    // ADR-0022 § Q5 "override cannot be silent" contract (backported from
+    // gh-identity-guard — issue #258). The report-only profile deliberately
+    // survives the bypass: SKIP_DESTRUCTIVE_GUARD waives the blast-radius
+    // guard, not the wrapper's report-only contract (ADR-0091).
     pi.on("session_start", (_event, ctx) => {
       if (!ctx.hasUI) return;
       ctx.ui.notify(
-        "bash-destructive-guard: bypassed via SKIP_DESTRUCTIVE_GUARD=1",
+        profileActive
+          ? "bash-destructive-guard: general rules bypassed via SKIP_DESTRUCTIVE_GUARD=1; report-only profile remains active"
+          : "bash-destructive-guard: bypassed via SKIP_DESTRUCTIVE_GUARD=1",
         "warning",
       );
     });
-    return;
+    if (!profileActive) return;
   }
 
   pi.on("tool_call", async (event, ctx) => {
@@ -364,7 +357,9 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason };
     };
 
-    const safePaths = ["/tmp", ctx.cwd, ...loadUserSafePaths()];
+    // Safe-list entries are canonicalized once per call so both sides of the
+    // isUnderSafePath comparison are in resolved form (#554).
+    const safePaths = ["/tmp", ctx.cwd, ...loadUserSafePaths()].map(canonicalize);
     const command = preprocessCommand(raw);
     // Analyze the command AND a deglued variant (word-internal empty command
     // substitutions removed) so `r$(true)m` is caught. A rule tripping in
@@ -374,8 +369,17 @@ export default function (pi: ExtensionAPI) {
 
     for (const variant of variants) {
       for (const seg of lex(variant)) {
-        const reason = analyzeSegment(seg, safePaths);
-        if (reason) return block(reason);
+        if (profileActive) {
+          const profileReason = analyzeReportOnlySegment(seg);
+          if (profileReason) return block(profileReason);
+        }
+        if (!skipGeneral) {
+          const reason = analyzeSegment(seg, safePaths);
+          // Under the profile, scrub override advertisements from any
+          // general-rule denial that fires (ADR-0091 — no profile-reachable
+          // message may name a self-service override).
+          if (reason) return block(profileActive ? sanitizeGeneralDenyForProfile(reason) : reason);
+        }
       }
     }
 

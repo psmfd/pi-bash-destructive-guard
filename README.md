@@ -57,7 +57,21 @@ User-extendable via `~/.config/pi/bash-guard-safe-paths.conf`:
 /srv/scratch
 ```
 
-The `cwd` entry means the extension does not block destructive operations within the project pi is operating on. That is intentional — destructive operations within the project (e.g. `rm node_modules`) are part of normal workflow and the project's own VCS is the recovery mechanism.
+The `cwd` entry means the extension does not block destructive operations within the project pi is operating on. That is intentional — destructive operations within the project (e.g. `rm node_modules`) are part of normal workflow and the project's own VCS is the recovery mechanism. The same reasoning resolves #554 Observation A: relative/in-cwd writes stay ungated in the general guard; the in-cwd write gate belongs to the report-only profile below (ADR-0091).
+
+Safe-list entries and absolute target paths are **canonicalized** (`realpathSync`, symlinks resolved; a not-yet-existing target resolves via its nearest existing ancestor) before comparison — #554 Observation B: on macOS a `/var/…` spelling never string-prefix-matched the canonical `/private/var/…` cwd entry, falsely denying in-cwd paths. Canonical comparison also closes the reverse under-block (a symlink inside cwd pointing outside the safe list previously passed on its cwd spelling).
+
+## Report-only profile (ADR-0091)
+
+When the child process env carries `PI_GUARD_PROFILE=report-only` — exported by the subagent extension for wrappers declaring `guard-profile: report-only` frontmatter (today: the `linter`) — `report-only.ts` adds a mutation gate on top of the general rules, turning the wrapper's prose report-only contract into a mechanical one (#551, motivated by the #535/ADR-0082 evaluation where a fix-framed task defeated the prose contract):
+
+- Mutating flags on any verb (`--fix`, `--unsafe-fixes`, `--write`, `--apply`, `--in-place`, …), word-level so wrapper-quoted payloads are caught.
+- In-place editors (`sed -i`, `perl -i`, `gofmt`/`goimports`/`shfmt -w`) and default-write formatters without their check flag (`ruff format`, `dotnet format`, `black`, `isort`, `rustfmt`, `cargo fmt`).
+- ANY output redirect or file-mutation verb targeting a non-`/tmp` path — **relative, in-cwd paths included** (the #535 `cat > transform.py` hole). `/tmp` scratch stays allowed.
+- git mutations (read-only subcommand allowlist), package-manager verbs (`npm`/`yarn`/`pnpm`/`pip`; `npx <tool>` itself is sanctioned — the wrapped tool's flags are still scanned), and the interpreter bypass shapes.
+- Exec-wrappers, two-class (the shared `WRAPPER_VERBS` set in `policy-verbs.ts`): flag-free **transparent** prefix wrappers (`sudo`, `env K=V`, `timeout 60`, …) recurse so the full rule set evaluates the real verb — `timeout 60 ruff check` stays allowed, `sudo rustfmt` is denied; **opaque** wrappers (`eval`, `xargs`, `su`, …) and any transparent wrapper carrying a dash-flag (a value-consuming flag like `sudo -u <user>` would misparse its value as the verb) take a fail-closed word-scan denying wrapped mutating verbs, conditional formatter/tool names, quoted redirects, and shell interpreters. `find` with `-delete`, or `-exec`/`-execdir` carrying a denied word, is denied regardless of root; read-only shapes (`find … -exec shellcheck {}`, `xargs shellcheck`) stay allowed. Belt-and-braces: a general-rule denial that fires while the profile is active has override advertisements scrubbed from its message.
+
+Profile deny messages advertise **no self-service override** (the #535 lesson: the general guard's own denial text taught the model the SKIP bypass). `SKIP_DESTRUCTIVE_GUARD=1` waives the general rules only — the profile handler stays installed (announced at session start). The env var is set-or-deleted by the parent at spawn (subagent LOCAL PATCH #7): never inherited, not settable from inside the child session.
 
 ## Refusal policy (per-rule)
 
@@ -81,7 +95,7 @@ The override **announces itself via `ctx.ui.notify`** on use — silent override
 
 | Override | Scope |
 |---|---|
-| `SKIP_DESTRUCTIVE_GUARD=1` in pi's env | Whole pi session — extension loads but installs no `tool_call` handler; announced once at session start via `warning`-level notify |
+| `SKIP_DESTRUCTIVE_GUARD=1` in pi's env | Whole pi session — waives the **general rules** (no `tool_call` handler unless a report-only profile is active, in which case the handler stays installed applying profile rules only); announced once at session start via `warning`-level notify naming what survives |
 
 In non-UI sessions (e.g. `pi -p`) the notify call is suppressed cleanly via the `ctx.hasUI` guard.
 
