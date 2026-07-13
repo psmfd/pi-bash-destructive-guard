@@ -51,18 +51,27 @@
  *     6. `truncate -s <n> <unsafe path>`                    → DENY
  *     7. Anything else                                      → allow
  *
- * Residual gaps (fail-open by design; adversarial, not accidental):
- *   - ANSI-C-quoted verbs/flags: `$'\x72m' /x`, `bash $'-c\nrm /x'`
+ * AST second pass (#506, ADR-0100 — see ast-second-pass.ts): when a command
+ * uses substitution or ANSI-C quoting, the vendored pi-bash-parser binary
+ * provides a real parse and the SAME policy is re-applied to it, closing the
+ * hand-lexer's gaps for ANSI-C-quoted verbs/flags (`$'\x72m' /x`) and
+ * destructive verbs in nested command substitution as their own command
+ * positions. Additive: it only ADDS a denial (binary present + parse ok +
+ * policy hit); binary-absent / parse-failure fall back to this hand-lexer
+ * unless PI_BASH_GUARD_AST_STRICT=1.
+ *
+ * Residual gaps (fail-open by design; adversarial, not accidental) — NOT closed
+ * by the AST pass because no single-command-string parser can resolve them:
  *   - parameter-default expansion: `${x:-rm} /x`
  *   - variable indirection: `R=rm; $R /x`
- *   - value-producing / non-glued substitution: `$(echo rm) -rf /`,
- *     `eval "$(printf rm) /x"` (the glued EMPTY case `r$(true)m` IS caught)
+ *   - value-producing substitution: `$(echo rm) -rf /` (the value only exists
+ *     at runtime; the parser renders it empty, the glued EMPTY case
+ *     `r$(true)m` IS caught)
  *   - base64/decode pipelines whose payload only exists after execution
  *   - file-content indirection: `make test` where the Makefile recipe deletes
  *   These require runtime expansion / execution the guard does not perform, or
- *   a control below the shell. The structural fixes are tracked in #506 (AST
- *   parser) and #507 (OS sandbox). Out of scope entirely (different verbs):
- *   `>>` append, `python -c 'os.remove(...)'`.
+ *   a control below the shell (#507 OS sandbox). Out of scope entirely
+ *   (different verbs): `>>` append, `python -c 'os.remove(...)'`.
  *
  * Source rule: this extension is the runtime counterpart to
  * agent/rules/secrets-guard.md's "blast-radius isolation" principle.
@@ -72,6 +81,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { astSecondPass, initAstConfig } from "./ast-second-pass.ts";
 import { canonicalize } from "./paths.ts";
 import { SHELL_INTERPRETERS, WRAPPER_VERBS } from "./policy-verbs.ts";
 import {
@@ -327,6 +337,10 @@ export default function (pi: ExtensionAPI) {
   // starts, so an in-session `export PI_GUARD_PROFILE=` cannot un-certify
   // the agent.
   const profileActive = isReportOnlyProfileActive();
+  // AST second-pass posture (strict mode + resolved parser path) is likewise
+  // captured ONCE at load, for the same reason: an in-session env mutation must
+  // not downgrade strict->additive or repoint the binary mid-session (#506).
+  const astCfg = initAstConfig();
 
   if (skipGeneral) {
     // Session-wide bypass of the GENERAL rules. Announce via notify per
@@ -379,6 +393,32 @@ export default function (pi: ExtensionAPI) {
           // general-rule denial that fires (ADR-0091 — no profile-reachable
           // message may name a self-service override).
           if (reason) return block(profileActive ? sanitizeGeneralDenyForProfile(reason) : reason);
+        }
+      }
+    }
+
+    // AST second opinion (#506, ADR-0100): only for substitution / ANSI-C
+    // shapes the hand-lexer cannot resolve, and only when the hand-lexer found
+    // nothing above. The parser returns segments; we re-apply the SAME two
+    // policies the hand-lexer loop above uses (report-only profile, then the
+    // general blast-radius policy), so the AST pass extends BOTH contracts —
+    // not just the general one. Additive by default; strict mode adds a meta
+    // denial on parser-unavailable / parse-failure.
+    if (profileActive || !skipGeneral) {
+      const ast = await astSecondPass(command, astCfg);
+      if (ast.kind === "deny") {
+        return block(profileActive ? sanitizeGeneralDenyForProfile(ast.reason) : ast.reason);
+      }
+      if (ast.kind === "segments") {
+        for (const seg of ast.segments) {
+          if (profileActive) {
+            const profileReason = analyzeReportOnlySegment(seg);
+            if (profileReason) return block(profileReason);
+          }
+          if (!skipGeneral) {
+            const reason = analyzeSegment(seg, safePaths);
+            if (reason) return block(profileActive ? sanitizeGeneralDenyForProfile(reason) : reason);
+          }
         }
       }
     }

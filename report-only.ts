@@ -34,10 +34,13 @@
  *
  * THREAT MODEL — same class as the parent guard (see index.ts header):
  * discipline enforcement against a naive or instruction-following model,
- * NOT a sandbox against adversarial shell. ANSI-C quoting, variable
- * indirection, runtime-decoded payloads, and second-interpreter files
- * (`make lint` whose recipe rewrites sources) remain out of scope (#506,
- * #507). Scratch writes under /tmp stay allowed so linters can work.
+ * NOT a sandbox against adversarial shell. ANSI-C quoting and nested command
+ * substitution are now caught for THIS profile too when the pi-bash-parser AST
+ * second pass is available (#506, ADR-0100 — index.ts applies this profile's
+ * analyzeReportOnlySegment to the AST-discovered segments, not only the general
+ * policy). Variable indirection, runtime-decoded payloads, and second-
+ * interpreter files (`make lint` whose recipe rewrites sources) remain out of
+ * scope (#507). Scratch writes under /tmp stay allowed so linters can work.
  */
 
 import { hasMinusC, stripEnvAssignments, type Segment } from "./shared/shell-lex.ts";
@@ -66,7 +69,7 @@ function deny(what: string): string {
 export function sanitizeGeneralDenyForProfile(reason: string): string {
   const scrubbed = reason
     .split("\n")
-    .filter((l) => !/SKIP_DESTRUCTIVE_GUARD|bash-guard-safe-paths\.conf/.test(l))
+    .filter((l) => !/SKIP_DESTRUCTIVE_GUARD|bash-guard-safe-paths\.conf|PI_BASH_GUARD_AST_STRICT/.test(l))
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trimEnd();
