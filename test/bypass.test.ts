@@ -127,6 +127,26 @@ const denied = [
   ["dd to unsafe file path", "dd if=/dev/zero of=/etc/important"],
   ["truncate unsafe path", "truncate -s 0 /etc/passwd"],
   ["truncate --size unsafe path", "truncate --size=0 /etc/hosts"],
+  // ---- #798 / ADR-0112: tilde home-path expansion (was misclassified safe) ----
+  ["rm tilde ssh key", "rm ~/.ssh/id_rsa"],
+  ["dd of= tilde credentials", "dd if=/dev/zero of=~/.aws/credentials"],
+  ["clobber to tilde path", "echo x > ~/.ssh/authorized_keys"],
+  ["truncate tilde history", "truncate -s0 ~/.bash_history"],
+  ["mv into tilde path", "mv /etc/hosts ~/stolen"],
+  ["rm ~user unresolvable home", "rm ~root/.bashrc"],
+  // ---- #798 / ADR-0112: destructive op routed through a wrapper ----
+  ["sudo wraps dd to a sensitive file", "sudo dd if=/dev/zero of=/etc/shadow"],
+  ["timeout wraps truncate", "timeout 5 truncate -s0 /etc/passwd"],
+  ["sudo wraps find -delete", "sudo find / -delete"],
+  ["eval wraps quoted clobber redirect", "eval 'echo x > /etc/passwd'"],
+  ["eval wraps truncate", "eval 'truncate -s0 /etc/passwd'"],
+  ["eval wraps find -delete", "eval 'find /etc -delete'"],
+  ["sudo wraps absolute-path rm", "sudo /bin/rm -rf /etc"],
+  // ---- #798 / ADR-0112: find global options before the root ----
+  ["find -L then unsafe root -delete", "find -L /etc -delete"],
+  ["find -H then unsafe root -delete", "find -H /etc -delete"],
+  // ---- #798: bash -c stays blocked after hasMinusC option-scoping ----
+  ["bash -c rm still blocked", "bash -c 'rm /etc/passwd'"],
 ] as const;
 
 for (const [name, cmd] of denied) {
@@ -177,6 +197,11 @@ const allowed = [
   ["truncate a relative path", "truncate -s 0 rel.txt"],
   ["glued non-empty substitution stays benign", "echo v$(date +%s)x"],
   ["pipe into python is a documented gap, not blocked", "cat data | python3 process.py"],
+  // ---- #798 / ADR-0112: hasMinusC scoped to the option region (no over-block) ----
+  ["bash script with -c-looking script arg", "bash run.sh -clean"],
+  ["bash script with -cache script arg", "bash build.sh -cache"],
+  ["find -L delete under cwd stays safe", "find -L . -delete"],
+  ["find -L delete under /tmp stays safe", "find -L /tmp -delete"],
 ] as const;
 
 for (const [name, cmd] of allowed) {

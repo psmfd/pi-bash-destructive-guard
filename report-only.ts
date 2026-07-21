@@ -208,6 +208,11 @@ const TRANSPARENT_PREFIX_WRAPPERS = new Set([
 // and rule-evaluable — form for all of these.
 const WRAPPED_DENY_WORDS = new Set([
   ...MUTATING_VERB_WORDS,
+  // `find` is opaque inside a wrapper payload: the dedicated find -delete/-exec
+  // handling below only runs when `find` is the segment's own leading verb, so
+  // `eval 'find /etc -delete'` would otherwise bypass this profile (#798,
+  // ADR-0112). Direct `find` invocation remains rule-evaluable.
+  "find",
   "ruff",
   "black",
   "isort",
@@ -307,13 +312,17 @@ function scanOpaqueWrapperArgs(verb: string, args: string[]): string | null {
       return deny(`'${verb}' wraps an output redirect — redirects may not be routed through wrappers`);
     }
     for (const w of t.split(/\s+/)) {
-      if (WRAPPED_DENY_WORDS.has(w)) {
+      // Basename-normalize so a wrapped absolute path (`eval '/bin/rm /x'`)
+      // classifies like its basename, matching the segment verb's own
+      // normalization (#798, ADR-0112).
+      const base = basenameOf(w);
+      if (WRAPPED_DENY_WORDS.has(base)) {
         return deny(
-          `'${verb}' wraps '${w}' — invoke tools directly in their report/check form so each command can be evaluated on its own`,
+          `'${verb}' wraps '${base}' — invoke tools directly in their report/check form so each command can be evaluated on its own`,
         );
       }
-      if (SHELL_INTERPRETERS.has(w)) {
-        return deny(`'${verb}' wraps shell interpreter '${w}' — cannot be statically checked`);
+      if (SHELL_INTERPRETERS.has(base)) {
+        return deny(`'${verb}' wraps shell interpreter '${base}' — cannot be statically checked`);
       }
     }
   }
@@ -445,19 +454,24 @@ export function analyzeReportOnlySegment(seg: Segment): string | null {
   if (checkFlags && !tokens.some((t) => checkFlags.includes(t))) {
     return deny(`bare '${verb}' rewrites files — use ${checkFlags.join(" or ")}`);
   }
-  if (verb === "ruff" && tokens[1] === "format" && !tokens.includes("--check") && !tokens.includes("--diff")) {
+  // Subcommand = first non-flag token, not tokens[1]: several of these tools
+  // accept a global flag before the subcommand in normal usage
+  // (`terraform -chdir=infra fmt`, `dotnet --verbosity q format`), which a
+  // hard-coded tokens[1] would let slip past the deny (#798, ADR-0112).
+  const subcmd = tokens.slice(1).find((t) => !t.startsWith("-"));
+  if (verb === "ruff" && subcmd === "format" && !tokens.includes("--check") && !tokens.includes("--diff")) {
     return deny(`'ruff format' without --check/--diff rewrites files`);
   }
-  if (verb === "dotnet" && tokens[1] === "format" && !tokens.includes("--verify-no-changes")) {
+  if (verb === "dotnet" && subcmd === "format" && !tokens.includes("--verify-no-changes")) {
     return deny(`'dotnet format' without --verify-no-changes rewrites files`);
   }
-  if (verb === "cargo" && tokens[1] === "fmt" && !tokens.includes("--check")) {
+  if (verb === "cargo" && subcmd === "fmt" && !tokens.includes("--check")) {
     return deny(`'cargo fmt' without --check rewrites files`);
   }
-  if (verb === "terraform" && tokens[1] === "fmt" && !tokens.includes("-check") && !tokens.includes("--check")) {
+  if (verb === "terraform" && subcmd === "fmt" && !tokens.includes("-check") && !tokens.includes("--check")) {
     return deny(`'terraform fmt' without -check rewrites files`);
   }
-  if (verb === "go" && tokens[1] === "fmt") {
+  if (verb === "go" && subcmd === "fmt") {
     return deny(`'go fmt' rewrites files — use 'gofmt -l' to report`);
   }
 

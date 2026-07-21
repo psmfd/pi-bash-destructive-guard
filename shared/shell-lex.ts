@@ -75,6 +75,15 @@ const GLUED_SUBST_RE = /(?<=[A-Za-z0-9_])(?:\$\([^()]*\)|`[^`]*`)(?=[A-Za-z0-9_]
  * introducing line (e.g. `cat <<EOF`, `bash <<EOF`) is kept and still
  * analyzed — a shell interpreter reading a heredoc script is caught by the
  * stdin-redirect check, while a data heredoc (`cat`) is harmless.
+ *
+ * NOTE: this copy KEEPS the `<<DELIM` operator on the introducing line on
+ * purpose — it is designed to be paired with `lex()` below, which treats `<`
+ * as a redirect operator. An argv-position consumer that has no `<` awareness
+ * (e.g. gh-identity-guard's classifier) must NOT use this primitive directly:
+ * a glued `git<<EOF push …` would leave `git<<EOF` as one token and misclassify.
+ * gh-identity-guard therefore keeps its own operator-EXCISING variant — a
+ * deliberate duplicate, not drift (see its `classifier.ts` stripHeredocs and
+ * ADR-0113/ADR-0088).
  */
 export function stripHeredocs(command: string): string {
   const lines = command.split("\n");
@@ -263,7 +272,20 @@ export function stripEnvAssignments(tokens: string[]): string[] {
   return tokens.slice(i);
 }
 
-/** `-c`, or a single-dash short-option cluster containing `c` (`-ec`, `-xc`). */
+/**
+ * True if the interpreter is invoked with a `-c` command-string option: bare
+ * `-c`, or a single-dash short-option cluster containing `c` (`-ec`, `-xc`).
+ * Scans only the OPTION region — the leading flag tokens after the verb, up to
+ * the first non-flag token (the script path or `-c`'s command string). A `c`-
+ * bearing token AFTER the script path is a script argument, not a bash option
+ * (`bash run.sh -clean` must not read as `-c`); scanning the whole token list
+ * over-blocked those (#798, ADR-0112). `bash -c '…'` still matches — `-c` is
+ * always an option, hence in the leading flag region.
+ */
 export function hasMinusC(tokens: string[]): boolean {
-  return tokens.some((t) => t === "-c" || /^-[A-Za-z]*c[A-Za-z]*$/.test(t));
+  for (const t of tokens.slice(1)) {
+    if (!t.startsWith("-")) return false; // first non-flag token → options end
+    if (t === "-c" || /^-[A-Za-z]*c[A-Za-z]*$/.test(t)) return true;
+  }
+  return false;
 }

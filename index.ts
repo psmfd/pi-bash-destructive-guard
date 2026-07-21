@@ -44,7 +44,8 @@
  *     1. Shell-interpreter verb (bash/sh/...) with `-c`, reading a script from
  *        stdin/file (`<`/`<<`/`<<<`), OR as a `|` pipeline sink → DENY (bypass)
  *     2. Exec-wrapper verb (eval/xargs/sudo/find/...) whose token list contains
- *        `rm`/`mv` as a standalone token                    → DENY
+ *        a destructive operation — rm/mv/dd/truncate (basename-normalized),
+ *        `find -delete`, or a quote-embedded `>` clobber                → DENY
  *     3. `rm`/`mv` targeting an unsafe path                 → DENY
  *     4. `find ... -delete` rooted at an unsafe path        → DENY
  *     5. `dd of=<device|unsafe path>`                       → DENY
@@ -118,17 +119,37 @@ function loadUserSafePaths(): string[] {
   }
 }
 
-// True if any wrapped token contains rm|mv as a standalone WORD. Word-level
+// Destructive verbs that cannot be statically validated once wrapped, so the
+// whole wrapped invocation is refused. Mirrors the direct-invocation surface
+// (rules 3/5/6) — a verb added there must be added here too, or the wrapper
+// path silently re-opens the bypass (#798, ADR-0112).
+const WRAPPED_DESTRUCTIVE_WORDS = new Set(["rm", "mv", "dd", "truncate"]);
+
+// True if a wrapper's argument tokens carry a destructive operation. Word-level
 // (not token-exact) so a wrapped command string carried in one quoted token
-// (`eval 'rm /x'`, `su -c 'rm /x'`) is detected, while a path component
-// named rm/mv (`/home/rm/file`) is not.
+// (`eval 'rm /x'`, `su -c 'rm /x'`) is detected, while a path component named
+// rm/mv (`/home/rm/file`) is not. Each word is basename-normalized so a wrapped
+// absolute path (`sudo /bin/rm`) classifies like its basename, matching how the
+// segment's own leading verb is normalized (#798, ADR-0112). Three surfaces:
+//   - a WRAPPED_DESTRUCTIVE_WORDS verb (rm/mv/dd/truncate);
+//   - a quoted `>` clobber — a redirect inside a wrapper payload never surfaces
+//     as a structural Redirect (`eval 'echo x > /etc/passwd'`), so checkClobber
+//     cannot see it; only unquoted redirects reach seg.redirects;
+//   - `find` co-occurring with `-delete` (wrapped `find` is not the segment
+//     verb, so rule 4 never runs).
 function wrapsDestructive(tokens: string[]): boolean {
+  let sawFind = false;
+  let sawDelete = false;
   for (const t of tokens.slice(1)) {
+    if (t.includes(">")) return true;
     for (const w of t.split(/\s+/)) {
-      if (w === "rm" || w === "mv") return true;
+      const base = w.split("/").pop() || w;
+      if (WRAPPED_DESTRUCTIVE_WORDS.has(base)) return true;
+      if (base === "find") sawFind = true;
+      if (w === "-delete") sawDelete = true;
     }
   }
-  return false;
+  return sawFind && sawDelete;
 }
 
 function isUnderSafePath(target: string, safePaths: string[]): boolean {
@@ -163,6 +184,29 @@ Suggested alternatives:
   - Resolve the path to its absolute form and re-issue with the absolute path.
   - If the intent was relative to cwd, drop the \`..\` segments and use the direct relative path.`;
   }
+  // A leading `~` is NOT relative to cwd — bash expands it to the user's home
+  // directory, which is outside cwd and usually off the safe list. Resolve it
+  // and safe-check the absolute target; reject `~user/…` forms, which cannot be
+  // resolved statically (#798, ADR-0112). Without this, `rm ~/.ssh/id_rsa` and
+  // `dd of=~/.aws/credentials` fell through the relative-path exemption below.
+  if (p.startsWith("~")) {
+    if (p === "~" || p.startsWith("~/")) {
+      const resolved = p === "~" ? homedir() : join(homedir(), p.slice(2));
+      if (!isUnderSafePath(resolved, safePaths)) {
+        return `bash-destructive-guard: ${label} '${p}' (→ '${resolved}') — home-directory path outside safe list (${safePaths.join(", ")}).
+
+Suggested alternatives:
+  - If the target is genuinely under home, add its parent to \`~/.config/pi/bash-guard-safe-paths.conf\` (one path per line) and retry.
+  - If you only need a scratch location, work under \`/tmp\` — already in the safe list.
+  - Last resort for a one-off destructive operation: set \`SKIP_DESTRUCTIVE_GUARD=1\` in the pi session env.`;
+      }
+      return null;
+    }
+    return `bash-destructive-guard: ${label} path '${p}' uses a \`~user\` home reference that cannot be resolved statically — refusing for safety.
+
+Suggested alternatives:
+  - Re-issue with the resolved absolute path so it can be checked against the safe list.`;
+  }
   if (!p.startsWith("/")) return null; // relative → within cwd → safe
   if (!isUnderSafePath(p, safePaths)) {
     return `bash-destructive-guard: ${label} '${p}' — path outside safe list (${safePaths.join(", ")}).
@@ -190,12 +234,23 @@ function destructivePathTokens(tokens: string[]): string[] {
   return paths;
 }
 
-// Leading path operands before the first `-flag` (used by `find`, whose paths
-// precede the expression: `find <path>... -delete`).
+// Leading path operands before the first expression primary (used by `find`,
+// whose paths precede the expression: `find <path>... -delete`). GNU find
+// accepts global options BEFORE the paths — -H/-L/-P (symlink handling),
+// -D <debugopts>, -O<level> — which must be skipped, not treated as the first
+// `-flag`. Otherwise `find -L /etc -delete` breaks on -L, yields an empty root
+// list, and is misclassified as "no root → cwd → safe" (#798, ADR-0112).
 function leadingPathArgs(tokens: string[]): string[] {
   const paths: string[] = [];
-  for (const t of tokens.slice(1)) {
-    if (t.startsWith("-")) break;
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "-H" || t === "-L" || t === "-P") continue;
+    if (t === "-D") {
+      i++; // consume the debug-options value
+      continue;
+    }
+    if (/^-O[0-9]?$/.test(t)) continue; // -O, -O1, -O2, -O3
+    if (t.startsWith("-")) break; // first expression primary (-delete, -name, …)
     paths.push(t);
   }
   return paths;
@@ -294,9 +349,10 @@ function analyzeSegment(seg: Segment, safePaths: string[]): string | null {
 This is a hard refusal — do not retry by re-wrapping the same payload. The bypass intent itself is what is blocked, not the wrapped command. If the wrapped command is legitimate, invoke it directly without the \`${verb}\` wrapper (no \`-c\`, no \`<<\`/\`<<<\`, no \`| ${verb}\`) so each verb can be evaluated on its own merits.`;
   }
 
-  // Rule 2 — exec-wrapper whose token list contains a destructive verb.
+  // Rule 2 — exec-wrapper whose token list contains a destructive operation
+  // (rm/mv/dd/truncate, find -delete, or a quote-embedded clobber redirect).
   if (WRAPPER_VERBS.has(verb) && wrapsDestructive(tokens)) {
-    return `bash-destructive-guard: '${verb}' wraps a destructive verb (rm|mv) — refusing for safety (the wrapped target cannot be statically validated).
+    return `bash-destructive-guard: '${verb}' wraps a destructive operation (rm/mv/dd/truncate, find -delete, or a redirect) — refusing for safety (the wrapped target cannot be statically validated).
 
 Suggested alternatives:
   - Invoke the destructive command directly (e.g. \`rm <path>\`) without the \`${verb}\` wrapper so the path can be evaluated against the safe list.

@@ -167,6 +167,14 @@ const denied: Array<[string, string]> = [
   ["env -u flag npm install", "env -u FOO npm install"],
   ["time -f format black", 'time -f "%e" black src/'],
   ["sudo -E rustfmt (flagged transparent falls closed)", "sudo -E rustfmt src/main.rs"],
+  // ---- #798 / ADR-0112: parity with the general-guard fixes ----
+  // Basename-normalized wrapped verb: `/bin/rm` must classify like `rm`.
+  ["eval-wrapped absolute-path rm (basename)", "eval '/bin/rm transform.py'"],
+  // Opaque-wrapped find -delete: `find` now in WRAPPED_DENY_WORDS.
+  ["eval-wrapped find -delete (opaque find)", "eval 'find /etc -delete'"],
+  // Formatter subcommand located as first non-flag token, not tokens[1], so a
+  // glued global flag before the subcommand no longer slips past the deny.
+  ["terraform glued global flag before fmt", "terraform -chdir=infra fmt"],
 ];
 
 for (const [name, cmd] of denied) {
@@ -224,6 +232,9 @@ const allowed: Array<[string, string]> = [
   ["sudo-wrapped ruff check", "sudo ruff check src/"],
   ["env-wrapped shellcheck", "env TERM=dumb shellcheck script.sh"],
   ["timeout-wrapped rustfmt --check", "timeout 30 rustfmt --check src/main.rs"],
+  // #798 / ADR-0112: check-mode with a glued global flag stays allowed — the
+  // subcommand-locating fix must not over-deny the report form.
+  ["terraform check with glued global flag", "terraform -chdir=infra fmt -check"],
 ];
 
 for (const [name, cmd] of allowed) {
