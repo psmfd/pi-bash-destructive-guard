@@ -329,11 +329,24 @@ function scanOpaqueWrapperArgs(verb: string, args: string[]): string | null {
   return null;
 }
 
-// Per-segment report-only policy. Returns a deny reason or null.
-export function analyzeReportOnlySegment(seg: Segment): string | null {
-  // R1 — ANY output redirect (>, >|, >>) to a non-/tmp target. The general
-  // guard's clobber rule exempts relative/cwd targets and `>>`; the
-  // report-only contract exempts neither.
+/**
+ * Outcome of a verb-CONSUMING rule (#799). Three states, because R2b/R5/R6/R7
+ * do more than deny-or-pass: when such a rule recognizes the verb as its own
+ * and clears it, later rules must NOT re-inspect the segment (`rm /tmp/x` is
+ * allowed by R5 and must not reach R8; a clean transparent-wrapper recursion
+ * already applied the full rule set to the real verb).
+ *
+ *   - a string        → deny with that reason
+ *   - RULE_CONSUMED   → the rule owns this verb and allows it; stop evaluating
+ *   - null            → the rule does not apply; continue to the next rule
+ */
+const RULE_CONSUMED: unique symbol = Symbol("rule-consumed");
+type ConsumingOutcome = string | typeof RULE_CONSUMED | null;
+
+// R1 — ANY output redirect (>, >|, >>) to a non-/tmp target. The general
+// guard's clobber rule exempts relative/cwd targets and `>>`; the
+// report-only contract exempts neither.
+function checkRedirects(seg: Segment): string | null {
   for (const r of seg.redirects) {
     if (!r.target) continue;
     if (!underTmp(r.target)) {
@@ -342,13 +355,12 @@ export function analyzeReportOnlySegment(seg: Segment): string | null {
       );
     }
   }
+  return null;
+}
 
-  const tokens = stripEnvAssignments(seg.tokens);
-  if (tokens.length === 0) return null;
-  const verb = basenameOf(tokens[0]);
-
-  // R2 — mutating flag anywhere in the segment, word-level so wrapper-quoted
-  // payloads (`eval 'ruff check --fix .'`) are caught too.
+// R2 — mutating flag anywhere in the segment, word-level so wrapper-quoted
+// payloads (`eval 'ruff check --fix .'`) are caught too.
+function checkMutatingFlags(verb: string, tokens: string[]): string | null {
   for (const t of tokens) {
     for (const w of t.split(/\s+/)) {
       const flag = w.includes("=") ? w.slice(0, w.indexOf("=")) : w;
@@ -360,26 +372,29 @@ export function analyzeReportOnlySegment(seg: Segment): string | null {
       }
     }
   }
+  return null;
+}
 
-  // R2b — exec-wrappers and find: verb-position rules below cannot see a
-  // mutation routed through `eval`/`sudo`/`xargs`/`find -exec` (the wrapper
-  // is the verb). Without this, wrapped rm/mv would fall through to the
-  // general guard's Rule 2 — whose deny text advertises
-  // SKIP_DESTRUCTIVE_GUARD=1, and setting it would disarm the only check
-  // blocking the command (the exact #535 sequence this profile closes).
-  //
-  // Two wrapper classes (closure-verification finding: a flat word-list
-  // could not cover the conditional verbs — `ruff`/`black`/`cargo` are
-  // legitimate directly but not resolvable inside an opaque payload —
-  // without breaking `timeout 60 ruff check`):
-  //   TRANSPARENT prefix wrappers (sudo/env/timeout/…): the wrapped command
-  //   follows in argv — skip the wrapper's own flags/duration/assignments
-  //   and RECURSE, so the full rule set (R2–R8) applies to the real verb.
-  //   OPAQUE wrappers (eval/xargs/su/watch/…): the payload cannot be
-  //   resolved to a command position — deny on any wrapped redirect,
-  //   interpreter, or word in the wide WRAPPED_DENY_WORDS set. Recovery is
-  //   documented in the message: invoke the tool directly (where the
-  //   conditional rules can evaluate it).
+// R2b — exec-wrappers and find: verb-position rules cannot see a mutation
+// routed through `eval`/`sudo`/`xargs`/`find -exec` (the wrapper is the
+// verb). Without this, wrapped rm/mv would fall through to the general
+// guard's Rule 2 — whose deny text advertises SKIP_DESTRUCTIVE_GUARD=1, and
+// setting it would disarm the only check blocking the command (the exact
+// #535 sequence this profile closes).
+//
+// Two wrapper classes (closure-verification finding: a flat word-list
+// could not cover the conditional verbs — `ruff`/`black`/`cargo` are
+// legitimate directly but not resolvable inside an opaque payload —
+// without breaking `timeout 60 ruff check`):
+//   TRANSPARENT prefix wrappers (sudo/env/timeout/…): the wrapped command
+//   follows in argv — skip the wrapper's own flags/duration/assignments
+//   and RECURSE, so the full rule set (R2–R8) applies to the real verb.
+//   OPAQUE wrappers (eval/xargs/su/watch/…): the payload cannot be
+//   resolved to a command position — deny on any wrapped redirect,
+//   interpreter, or word in the wide WRAPPED_DENY_WORDS set. Recovery is
+//   documented in the message: invoke the tool directly (where the
+//   conditional rules can evaluate it).
+function checkWrapperRouting(verb: string, tokens: string[], seg: Segment): ConsumingOutcome {
   if (verb === "find") {
     if (tokens.includes("-delete")) {
       return deny(`'find -delete' removes files — the report-only contract forbids all deletion`);
@@ -394,7 +409,9 @@ export function analyzeReportOnlySegment(seg: Segment): string | null {
         }
       }
     }
-  } else if (TRANSPARENT_PREFIX_WRAPPERS.has(verb)) {
+    return null;
+  }
+  if (TRANSPARENT_PREFIX_WRAPPERS.has(verb)) {
     const rest = tokens.slice(1);
     let start = 0;
     // Skip only UNAMBIGUOUS wrapper arguments: env assignments (`K=V`) and
@@ -424,17 +441,19 @@ export function analyzeReportOnlySegment(seg: Segment): string | null {
         });
         if (inner) return inner;
       }
-      return null;
+      return RULE_CONSUMED;
     }
-    const opaque = scanOpaqueWrapperArgs(verb, rest);
-    if (opaque) return opaque;
-  } else if (WRAPPER_VERBS.has(verb)) {
-    const opaque = scanOpaqueWrapperArgs(verb, tokens.slice(1));
-    if (opaque) return opaque;
+    return scanOpaqueWrapperArgs(verb, rest);
   }
+  if (WRAPPER_VERBS.has(verb)) {
+    return scanOpaqueWrapperArgs(verb, tokens.slice(1));
+  }
+  return null;
+}
 
-  // R3 — in-place editors: sed/perl -i (any suffix form), gofmt/goimports/
-  // shfmt -w.
+// R3 — in-place editors: sed/perl -i (any suffix form), gofmt/goimports/
+// shfmt -w.
+function checkInPlaceEditors(verb: string, tokens: string[]): string | null {
   if (verb === "sed" || verb === "gsed" || verb === "perl") {
     for (const t of tokens.slice(1)) {
       if (t === "-i" || t.startsWith("-i.") || t.startsWith("--in-place") || (verb === "perl" && /^-[a-z]*i/.test(t))) {
@@ -448,8 +467,11 @@ export function analyzeReportOnlySegment(seg: Segment): string | null {
   if ((verb === "gofmt" || verb === "goimports" || verb === "shfmt") && tokens.includes("-w")) {
     return deny(`'${verb} -w' rewrites files`);
   }
+  return null;
+}
 
-  // R4 — formatters that write by default, unless a check/diff flag is given.
+// R4 — formatters that write by default, unless a check/diff flag is given.
+function checkDefaultWriteFormatters(verb: string, tokens: string[]): string | null {
   const checkFlags = DEFAULT_WRITE_FORMATTERS[verb];
   if (checkFlags && !tokens.some((t) => checkFlags.includes(t))) {
     return deny(`bare '${verb}' rewrites files — use ${checkFlags.join(" or ")}`);
@@ -474,16 +496,19 @@ export function analyzeReportOnlySegment(seg: Segment): string | null {
   if (verb === "go" && subcmd === "fmt") {
     return deny(`'go fmt' rewrites files — use 'gofmt -l' to report`);
   }
+  return null;
+}
 
-  // R5 — file-mutation verbs: write targets must be under /tmp. This is
-  // where the #535 relative in-cwd hole closes: `rm x`, `mv a b`,
-  // `touch report.md`, `cat > transform.py` are all denied.
+// R5 — file-mutation verbs: write targets must be under /tmp. This is
+// where the #535 relative in-cwd hole closes: `rm x`, `mv a b`,
+// `touch report.md`, `cat > transform.py` are all denied.
+function checkFileMutationPaths(verb: string, tokens: string[]): ConsumingOutcome {
   if (verb === "dd") {
     const of = tokens.find((t) => t.startsWith("of="));
     if (of && !underTmp(of.slice(3))) {
       return deny(`'dd ${of}' writes outside /tmp`);
     }
-    return null;
+    return RULE_CONSUMED;
   }
   if (TMP_ONLY_ALL_OPERANDS.has(verb) || verb === "mv") {
     for (const p of pathOperands(tokens)) {
@@ -491,7 +516,7 @@ export function analyzeReportOnlySegment(seg: Segment): string | null {
         return deny(`'${verb} ${p}' modifies a non-/tmp path`);
       }
     }
-    return null;
+    return RULE_CONSUMED;
   }
   if (TMP_ONLY_DEST_OPERAND.has(verb)) {
     const ops = pathOperands(tokens);
@@ -499,19 +524,23 @@ export function analyzeReportOnlySegment(seg: Segment): string | null {
     if (dest && !underTmp(dest)) {
       return deny(`'${verb} … ${dest}' writes to a non-/tmp path`);
     }
-    return null;
+    return RULE_CONSUMED;
   }
+  return null;
+}
 
-  // R6 — git: read-only subcommands only.
-  if (verb === "git") {
-    const sub = tokens.slice(1).find((t) => !t.startsWith("-"));
-    if (sub && !GIT_READONLY.has(sub)) {
-      return deny(`'git ${sub}' mutates repository state`);
-    }
-    return null;
+// R6 — git: read-only subcommands only.
+function checkGitReadonly(verb: string, tokens: string[]): ConsumingOutcome {
+  if (verb !== "git") return null;
+  const sub = tokens.slice(1).find((t) => !t.startsWith("-"));
+  if (sub && !GIT_READONLY.has(sub)) {
+    return deny(`'git ${sub}' mutates repository state`);
   }
+  return RULE_CONSUMED;
+}
 
-  // R7 — package managers: all verbs denied (install/run/exec).
+// R7 — package managers: all verbs denied (install/run/exec).
+function checkPackageManagers(verb: string, tokens: string[]): ConsumingOutcome {
   if (PKG_MANAGERS.has(verb)) {
     return deny(`'${verb}' installs packages or runs opaque scripts`);
   }
@@ -520,22 +549,65 @@ export function analyzeReportOnlySegment(seg: Segment): string | null {
     if (sub && !CARGO_READONLY.has(sub)) {
       return deny(`'cargo ${sub}' executes or writes build artifacts`);
     }
-    return null;
+    return RULE_CONSUMED;
   }
   if (verb === "npx" || verb === "pnpm-dlx" || verb === "bunx") {
     // The launcher itself is sanctioned; the wrapped tool's tokens were
     // already scanned by R2/R3/R4 above. Nothing further.
-    return null;
+    return RULE_CONSUMED;
   }
+  return null;
+}
 
-  // R8 — shell-interpreter bypass shapes (mirrors the general guard's Rule 1
-  // so the profile holds even when SKIP_DESTRUCTIVE_GUARD=1 disables the
-  // general rules).
+// R8 — shell-interpreter bypass shapes (mirrors the general guard's Rule 1
+// so the profile holds even when SKIP_DESTRUCTIVE_GUARD=1 disables the
+// general rules).
+function checkShellInterpreterBypass(verb: string, tokens: string[], seg: Segment): string | null {
   if (SHELL_INTERPRETERS.has(verb) && (seg.readsInput || seg.pipedInto || hasMinusC(tokens))) {
     return deny(
       `shell interpreter '${verb}' running a script from -c, stdin/file, or a pipeline sink cannot be statically checked`,
     );
   }
-
   return null;
+}
+
+// Per-segment report-only policy. Returns a deny reason or null. Pure
+// orchestration (#799): rules R1–R8 live in the named checkX helpers above,
+// mirroring the general guard's pattern in index.ts; the tri-state
+// ConsumingOutcome preserves the original fall-through semantics exactly
+// (a consuming rule that clears its verb stops evaluation).
+export function analyzeReportOnlySegment(seg: Segment): string | null {
+  const r1 = checkRedirects(seg);
+  if (r1) return r1;
+
+  const tokens = stripEnvAssignments(seg.tokens);
+  if (tokens.length === 0) return null;
+  const verb = basenameOf(tokens[0]);
+
+  const r2 = checkMutatingFlags(verb, tokens);
+  if (r2) return r2;
+
+  const r2b = checkWrapperRouting(verb, tokens, seg);
+  if (r2b === RULE_CONSUMED) return null;
+  if (r2b) return r2b;
+
+  const r3 = checkInPlaceEditors(verb, tokens);
+  if (r3) return r3;
+
+  const r4 = checkDefaultWriteFormatters(verb, tokens);
+  if (r4) return r4;
+
+  const r5 = checkFileMutationPaths(verb, tokens);
+  if (r5 === RULE_CONSUMED) return null;
+  if (r5) return r5;
+
+  const r6 = checkGitReadonly(verb, tokens);
+  if (r6 === RULE_CONSUMED) return null;
+  if (r6) return r6;
+
+  const r7 = checkPackageManagers(verb, tokens);
+  if (r7 === RULE_CONSUMED) return null;
+  if (r7) return r7;
+
+  return checkShellInterpreterBypass(verb, tokens, seg);
 }
